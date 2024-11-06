@@ -1,5 +1,5 @@
 # AmazonCloudWatchAlarm_remind-Notification
-AmazonCloudWatchAlarm_remind-Notification
+cloudwatch_remind.yamlをダウンロードしてお使いください。
 
 # パラメータ補足
 AWSAccountID
