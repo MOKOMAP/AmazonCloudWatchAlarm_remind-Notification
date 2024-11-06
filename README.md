@@ -1,7 +1,7 @@
 # AmazonCloudWatchAlarm_remind-Notification
 AmazonCloudWatchAlarm_remind-Notification
 
-#　パラメータ補足
+# パラメータ補足
 AWSAccountID
 →AWSのアカウントIDの12桁の数字を入力
 
