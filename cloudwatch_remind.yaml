@@ -1,0 +1,436 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+
+  CloudWatchAlarmArn:
+    Description: "CloudWatchAlarmArn" #remind通知させたいCloudWatchアラームのARN
+    Type: String
+
+  CloudWatchAlarmName:
+    Description: "SNSTopicArn" #remind通知させたいSNSTopicのARN
+    Type: String
+  
+  SNSTopicArn:
+    Description: "SNSTopicArn" #remind通知させたいSNSTopicのARN
+    Type: String
+
+  RegionName:
+    Description: "RegionName" #今回のリソースをデプロイしたいリージョン名　例：ap-northeast-1
+    Type: String
+
+  AWSAccountID:
+    Description: "AWSAccountID" 
+    Type: String
+
+
+
+Resources:
+
+#########################################
+#
+# Lambda 1 code
+#
+#########################################
+
+#Lambda IAM Policy
+  AlarmRemindeventsLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LambdaputCloudwatchLogs
+            Effect: Allow
+            Action: 
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "*"
+          - Sid: LambdastsAssumeRole
+            Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Resource: "*"
+          - Sid: Eventbridge
+            Effect: Allow
+            Action: 
+              - "events:*"
+              - "scheduler:*"
+            Resource: "*"
+          - Sid: "IAMPassRoleAccessForEventBridge"
+            Effect: Allow
+            Action: 
+              - "iam:PassRole"
+            Resource: "arn:aws:iam::*:role/*"
+            Condition:
+              StringLike:
+                iam:PassedToService: "events.amazonaws.com"
+          - Sid: "IAMPassRoleAccessForScheduler"
+            Effect: Allow
+            Action: 
+              - "iam:PassRole"
+            Resource: "arn:aws:iam::*:role/*"
+            Condition:
+              StringLike:
+                iam:PassedToService: "scheduler.amazonaws.com"
+
+#Lambda IAM Role
+  AlarmRemindeventsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: alarm_remind_events_lambda_Role
+      ManagedPolicyArns:
+        - !Ref AlarmRemindeventsLambdaPolicy
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: AlarmRemindeventsLambdaRole
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+
+#Lambda
+  AlarmRemindeventsLambdaFunc:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: alarm_remind_events_lambda
+      FunctionName: alarm_remind_events_lambda
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt AlarmRemindeventsLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      ReservedConcurrentExecutions: 20
+      Code:
+        ZipFile: !Sub |
+          import os
+          import boto3
+
+
+          bridge_events = boto3.client('events')
+          bridge_scheduler = boto3.client('scheduler')
+          cloudwatch_alarm_name = os.environ['WATCH_ALARM_NAME']
+          eventbridge_scheduler_group = os.environ['SCHEDULER_GROUP']
+
+
+          def lambda_handler(event, context):
+              rule_name = f"{cloudwatch_alarm_name}-alarm_remind_start" #EventBridgeSchedulerのルール名
+              group_name = eventbridge_scheduler_group #EventBridgeSchedulerのグループ名
+
+              value = event['detail']['state']['value']
+              print(f"アラームの状態{value}")
+
+              schedule_data = bridge_scheduler.get_schedule(
+                  GroupName = group_name,
+                  Name = rule_name
+              )
+              print(f"変更するルール名：{schedule_data['Name']}")
+              print(f"変更するルールが属しているグループ：{schedule_data['GroupName']}")
+              print(f"ルールの変更前の状態：{schedule_data['State']}")
+              print(f"フレキシブルタイムウィンドウの設定：{schedule_data['FlexibleTimeWindow']}")
+              print(f"rate式の設定: {schedule_data['ScheduleExpression']}")
+              print(f"ルールのターゲット：{schedule_data['Target']}")
+
+              schedule_update_data = []
+
+              if value == "ALARM":
+                  response = bridge_scheduler.update_schedule(
+                      Name = rule_name,
+                      GroupName = group_name,
+                      State = 'ENABLED',
+                      FlexibleTimeWindow = schedule_data['FlexibleTimeWindow'],
+                      ScheduleExpression = schedule_data['ScheduleExpression'],
+                      Target = schedule_data['Target']
+                  )
+                  print(f"ルール '{rule_name}' が有効化されました。")
+
+              elif value == "OK":
+                  response = bridge_scheduler.update_schedule(
+                      Name = rule_name,
+                      GroupName = group_name,
+                      State = 'DISABLED',
+                      FlexibleTimeWindow = schedule_data['FlexibleTimeWindow'],
+                      ScheduleExpression = schedule_data['ScheduleExpression'],
+                      Target = schedule_data['Target']
+                  )
+                  print(f"ルール '{rule_name}' が無効化されました。")
+
+                  schedule_update_data = bridge_scheduler.get_schedule(
+                      GroupName = group_name,
+                      Name = rule_name
+                  )
+
+                  print(f"変更されたルール名：{schedule_update_data['Name']}")
+                  print(f"変更されたルールが属しているグループ：{schedule_update_data['GroupName']}")
+                  print(f"ルールの変更後の状態：{schedule_update_data['State']}")
+                  print(f"フレキシブルタイムウィンドウの設定：{schedule_update_data['FlexibleTimeWindow']}")
+                  print(f"rate式の設定: {schedule_update_data['ScheduleExpression']}")
+                  print(f"ルールのターゲット：{schedule_update_data['Target']}")
+      Tags:
+        - Key: Name
+          Value: alarm_remind_scheduler_lambda
+      Environment:
+        Variables:
+          WATCH_ALARM_NAME: !Ref CloudWatchAlarmName
+          SCHEDULER_GROUP: !Ref EventBridgeSchedulerGroup
+
+#Lambda Invoke Permission
+  AlarmRemindeventsLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref AlarmRemindeventsLambdaFunc
+      Principal: events.amazonaws.com
+      SourceArn: !Sub arn:aws:events:${RegionName}:${AWSAccountID}:rule/*
+
+#########################################
+#
+# Lambda 2 code
+#
+#########################################
+
+
+  AlarmRemindSchedulerLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: LambdaputCloudwatchLogs
+            Effect: Allow
+            Action: 
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "*"
+          - Sid: LambdastsAssumeRole
+            Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Resource: "*"
+          - Sid: LambdaPublishSNS
+            Effect: Allow
+            Action: 
+              - sns:Publish
+            Resource: "*"
+          - Sid: Eventbridge
+            Effect: Allow
+            Action: 
+              - "events:*"
+              - "scheduler:*"
+            Resource: "*"
+          - Sid: "IAMPassRoleAccessForEventBridge"
+            Effect: Allow
+            Action: 
+              - "iam:PassRole"
+            Resource: "arn:aws:iam::*:role/*"
+            Condition:
+              StringLike:
+                iam:PassedToService: "events.amazonaws.com"
+          - Sid: "IAMPassRoleAccessForScheduler"
+            Effect: Allow
+            Action: 
+              - "iam:PassRole"
+            Resource: "arn:aws:iam::*:role/*"
+            Condition:
+              StringLike:
+                iam:PassedToService: "scheduler.amazonaws.com"
+          - Sid: LambdaKMS #SNSがKMSの有効化されているときのため用
+            Effect: Allow
+            Action: 
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*" 
+          - Sid: DescribeCloudwatch
+            Effect: Allow
+            Action: 
+              - "cloudwatch:*"
+            Resource: "*"
+
+  AlarmRemindSchedulerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: alarm_remind_scheduler_lambda_Role
+      ManagedPolicyArns:
+        - !Ref AlarmRemindSchedulerLambdaPolicy
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: AlarmRemindSchedulerLambdaRole
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+
+  AlarmRemindSchedulerLambdaFunc:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: alarm_remind_scheduler_lambda
+      FunctionName: alarm_remind_scheduler_lambda
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt AlarmRemindSchedulerLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      ReservedConcurrentExecutions: 20
+      Code:
+        ZipFile: !Sub |
+          import os
+          import boto3
+          from urllib.parse import quote
+
+          sns_client = boto3.client('sns')
+          cloudwatch_client = boto3.client('cloudwatch')
+          
+          sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+          cloudwatch_alarm_name = os.environ['WATCH_ALARM_NAME']
+          account_id = os.environ['AWS_ACCOUNT_ID']
+
+          def lambda_handler(event, context):
+              subject = 'None'
+              msg = 'None'
+
+              response = cloudwatch_client.describe_alarms(AlarmNames=[cloudwatch_alarm_name])
+              alarms = response['MetricAlarms']
+
+              alarm = alarms[0]
+              region = alarm['AlarmArn'].split(":")[3]
+              last_state_change = alarm['StateUpdatedTimestamp']
+              encoded_alarm_name = quote(alarm['AlarmName'])
+
+              alarm_arn = alarm['AlarmArn']
+              alarm_url = f"https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}#alarmsV2:alarm/{encoded_alarm_name}"
+              alarm_description = alarm.get('AlarmDescription', 'No description')
+              alarm_state_data = alarm['StateValue']
+              alarm_state_change = last_state_change.strftime("%A %d %B, %Y %H:%M:%S UTC")
+              alarm_state_reason = alarm['StateReason']
+
+              subject= f"ALARM: \"{cloudwatch_alarm_name}\" in Asia Pacific (Tokyo)"
+              msg=f"""
+          View this alarm in the AWS Management Console:
+          {alarm_url}
+                  
+          Alarm Details:
+          - Name:                       {cloudwatch_alarm_name}
+          - Description:                {alarm_description}
+          - State Change:               OK -> ALARM
+          - Reason for State Change:    {alarm_state_reason}
+          - Timestamp:                  {alarm_state_change}
+          - AWS Account:                {account_id}
+          - Alarm Arn:                  {alarm_arn}
+          """
+
+              response = sns_client.publish(
+              TopicArn=sns_topic_arn,
+              Message= msg,
+              Subject= subject
+              )
+              print("メールを送信しました。")
+      Tags:
+        - Key: Name
+          Value: alarm_remind_scheduler_lambda
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopicArn
+          WATCH_ALARM_NAME: !Ref CloudWatchAlarmName
+          SCHEDULER_GROUP: !Ref EventBridgeSchedulerGroup
+          AWS_ACCOUNT_ID: !Ref AWSAccountID
+
+  AlarmRemindSchedulerLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref AlarmRemindSchedulerLambdaFunc
+      Principal: scheduler.amazonaws.com
+      SourceArn: !Sub arn:aws:scheduler:${RegionName}:${AWSAccountID}:schedule/*
+
+
+#########################################
+#
+# EventBridgeEvents code
+#
+#########################################
+
+#EventBridgeEvents
+  AlarmStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Alarm-State-Change"
+      Name: "Alarm-State-Change"
+      EventPattern: 
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        resources:
+          - !Ref CloudWatchAlarmArn
+        detail:
+          alarmName:
+            - !Ref CloudWatchAlarmName
+          state:
+            value:
+              - ALARM
+              - OK
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt AlarmRemindeventsLambdaFunc.Arn
+          Id: "AlarmRemindeventsLambda"
+
+#########################################
+#
+# EventBridgeEvents code
+#
+#########################################
+
+  EventsSchedulerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: EventsScheduler
+            Effect: Allow
+            Action: 
+              - lambda:InvokeFunction
+            Resource: !GetAtt AlarmRemindSchedulerLambdaFunc.Arn
+
+  EventsSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EventsScheduler_Role
+      ManagedPolicyArns:
+        - !Ref EventsSchedulerPolicy
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: EventsSchedulerRole
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - "scheduler.amazonaws.com"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWSAccountID
+
+  EventBridgeSchedulerGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: "Alarm_Remind-Group"
+
+  # Start Schedule
+  EventBridgeSchedulerAlarmStateChangeRule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${CloudWatchAlarmName}-alarm_remind_start"
+      GroupName: !Ref EventBridgeSchedulerGroup
+      ScheduleExpression: "rate(1 minutes)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt AlarmRemindSchedulerLambdaFunc.Arn
+        RoleArn: !GetAtt EventsSchedulerRole.Arn
+      State: DISABLED
